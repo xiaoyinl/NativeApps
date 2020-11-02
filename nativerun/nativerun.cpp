@@ -1,12 +1,22 @@
+// This program was originally written by Pavel Yosifovich (https://github.com/zodiacon).
+// The original file can be found at https://github.com/zodiacon/NativeApps/blob/master/nativerun/nativerun.cpp
+
 // nativerun.cpp : This file contains the 'main' function. Program execution begins and ends there.
 //
-
+#include <ntstatus.h>
+#define WIN32_NO_STATUS
 #include <Windows.h>
 #include <winternl.h>
-#include <stdio.h>
+#include <iostream>
+#include <string>
 
 #pragma comment(lib, "ntdll")
 
+using std::wcout;
+using std::wstring;
+
+const wchar_t programPurpose[] = L"This program launches a Windows native application, a DLL, or a kernel driver as a user-mode exe.\n";
+const wchar_t programUsage[] = L"Usage:\n  nativerun.exe (use this program interactively)\n  nativerun.exe <executable> [params]\n  nativerun.exe /?  (show the help message)\n";
 typedef struct _RTL_USER_PROCESS_INFORMATION {
     ULONG Length;
     HANDLE Process;
@@ -16,7 +26,7 @@ typedef struct _RTL_USER_PROCESS_INFORMATION {
     BYTE reserved[64];
 } RTL_USER_PROCESS_INFORMATION, * PRTL_USER_PROCESS_INFORMATION;
 
-extern"C" {
+extern "C" {
     NTSTATUS NTAPI NtCreateProcess(
         _Out_ PHANDLE ProcessHandle,
         _In_ ACCESS_MASK DesiredAccess,
@@ -53,39 +63,109 @@ extern"C" {
         __in_opt PUNICODE_STRING RuntimeData
     );
 }
-
-int Error(NTSTATUS status) {
-    printf("Error (status=0x%08X)\n", status);
+int Error(NTSTATUS status)
+{
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND)
+    {
+        std::wcerr << L"Error: the file doesn't exist.\n";
+    }
+    else if (status == STATUS_INVALID_IMAGE_NOT_MZ)
+    {
+        std::wcerr << L"Error: the file is not a valid Windows PE executable file.\n";
+    }
+    else
+    {
+        std::wcerr << L"Error: status 0x" << std::hex << status << L"\n";
+    }
     return 1;
 }
+void toNativePath(_Inout_ wstring& winPath)
+{
+    if (winPath.find(L"\\Device\\") == 0 || winPath.find(L"\\??\\") == 0)
+    {
+        // already a valid native-mode file path
+        return;
+    }
+    wchar_t buf[MAX_PATH]{};
+    DWORD ret = GetFullPathNameW(winPath.c_str(), MAX_PATH, buf, nullptr);
+    if (ret == 0 || ret >= MAX_PATH - 1)
+    {
+        // If GetFullPathNameW returns 0, an error occurs.
+        // If it returns a size larger than or equal to MAX_PATH - 1, the buffer is too small. (This shouldn't happen, so treat it as an error)
+        winPath = L"";
+    }
+    else
+    {
+        wstring ntPath(L"\\??\\");
+        ntPath = ntPath + buf;
+        winPath = ntPath;
+    }
+}
+int wmain(int argc, const wchar_t* argv[])
+{
+    wstring exeToStart;
+    wstring paramList;
+    bool suspendInitialThread = false;
+    if (argc == 1)
+    {
+        wcout << programPurpose << L"\n";
+        wcout << L"Path of the file to launch: ";
+        std::getline(std::wcin, exeToStart);
+        wcout << L"Parameters: ";
+        std::getline(std::wcin, paramList);
 
-int wmain(int argc, const wchar_t* argv[]) {
-    if (argc < 2) {
-        printf("nativerun <executable> [params]\n");
+        wcout << L"Suspend the initial thread? (y/N): ";
+        wstring doSuspend;
+        std::getline(std::wcin, doSuspend);
+        if (doSuspend == L"Y" || doSuspend == L"y")
+            suspendInitialThread = true;
+    }
+    else if (argc == 2 && ( wcscmp(argv[1], L"/?") == 0 || wcscmp(argv[1], L"--help") == 0))
+    {
+        wcout << programPurpose << L"\n";
+        wcout << programUsage << L"\n";
         return 0;
     }
+    else if (argc == 2)
+    {
+        exeToStart = argv[1];
+    }
+    else
+    {
+        exeToStart = argv[1];
+        paramList = argv[2];
+    }
+    toNativePath(exeToStart);
+    if (exeToStart.size() == 0)
+    {
+        std::wcerr << L"You entered an invalid file path.\n";
+        return 1;
+    }
+    wcout << L"Launching file " << exeToStart << L"\n";
+    UNICODE_STRING name{};
+    RtlInitUnicodeString(&name, exeToStart.c_str());
 
-    UNICODE_STRING name;
-    RtlInitUnicodeString(&name, argv[1]);
+    UNICODE_STRING params{};
+    if (paramList.size() != 0)
+        RtlInitUnicodeString(&params, paramList.c_str());
+    else
+        RtlInitUnicodeString(&params, exeToStart.c_str());
 
-    RTL_USER_PROCESS_INFORMATION info;
-    PVOID params;
-    auto status = RtlCreateProcessParameters(&params, &name, nullptr, nullptr, &name,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr);
+    RTL_USER_PROCESS_INFORMATION info{};
+    PVOID processParams = nullptr;
+    auto status = RtlCreateProcessParameters(&processParams, &name, nullptr, nullptr, &params,
+        nullptr, nullptr, nullptr, nullptr, nullptr);
     if (!NT_SUCCESS(status))
         return Error(status);
 
-    status = RtlCreateUserProcess(&name, 0, params, nullptr, nullptr, nullptr, 0, nullptr, nullptr, &info);
+    status = RtlCreateUserProcess(&name, 0, processParams, nullptr, nullptr, nullptr, 0, nullptr, nullptr, &info);
     if (!NT_SUCCESS(status))
         return Error(status);
 
-    printf("Process 0x%p created!\n", info.ClientId.UniqueProcess);
+    wcout << L"Process " << HandleToULong(info.ClientId.UniqueProcess) << L" created!\n";
 
-    ResumeThread(info.Thread);
+    if (!suspendInitialThread)
+        ResumeThread(info.Thread);
 
     return 0;
 }
